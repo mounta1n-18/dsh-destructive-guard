@@ -1,0 +1,4 @@
+# 破坏性命令护栏 bundle：一条 Host 行。
+- insert:
+    - id: destructive-guard
+      name: '@local/dsh-destructive-guard'
