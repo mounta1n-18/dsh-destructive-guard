@@ -128,9 +128,26 @@ test('write / edit into protected files is denied before execution', async () =>
   assert.equal(allowed.kind, 'allow')
 })
 
-test('fails open on a non-shell tool and on an empty command', async () => {
+test('reading secret files is denied, ordinary files pass', async () => {
+  const { ctx, pre, guards } = makeContext()
+  apply(ctx)
+  const ssh = await pre[0]({ name: 'read', arguments: { file_path: `${HOME}\\.ssh\\id_ed25519` } }, next)
+  assert.equal(ssh.kind, 'deny')
+  assert.match(ssh.reason, /SECRET-READ/)
+
+  const env = await pre[0]({ name: 'read', arguments: { file_path: 'D:\\work\\proj\\.env' } }, next)
+  assert.equal(env.kind, 'deny')
+
+  const creds = guards[0]({ name: 'read', arguments: { file_path: `${HOME}\\.dsh\\.credentials.yaml` } })
+  assert.match(creds, /SECRET-READ/)
+
+  const ok = await pre[0]({ name: 'read', arguments: { file_path: 'D:\\work\\proj\\.env.example' } }, next)
+  assert.equal(ok.kind, 'allow')
+})
+
+test('fails open on an unknown tool and on an empty command', async () => {
   const { ctx, pre } = makeContext()
   apply(ctx)
-  assert.equal((await pre[0]({ name: 'read', arguments: { file_path: 'x' } }, next)).kind, 'allow')
+  assert.equal((await pre[0]({ name: 'grep', arguments: { pattern: 'x' } }, next)).kind, 'allow')
   assert.equal((await pre[0](exec(''), next)).kind, 'allow')
 })

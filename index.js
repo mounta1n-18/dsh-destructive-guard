@@ -5,20 +5,27 @@
  * - `tools/pre-execute`：返回 deny / ask，给出模型可读的理由；
  * - `tools.guard`：单调守卫，拦截 block 级命令，后续监听器无法把它改回允许。
  *
- * 只审查 shell 类工具（pwsh / bash / terminal / shell）的 command 参数；不注册工具，
- * 不注入提示词，不读写文件（除自身模块加载外）。判定是纯字符串分析，见 rules.mjs。
+ * 审查 shell 类工具（pwsh / bash / terminal / shell / ops_bash）的 command 参数、`write`/`edit`
+ * 与 dsh-ops 同名文件工具的落点，以及 `read` 读秘密文件；不注册工具，不注入提示词，不读写文件
+ * （除自身模块加载外）。判定是纯字符串分析，见 rules.mjs。
  */
 
 import { createRequire } from 'node:module'
 
-import { classify, classifyFileWrite, RULES, PROTECTED_ROOTS, WRITE_PROTECTED_COUNT } from './rules.mjs'
+import { classify, classifyFileWrite, isSecretPath, RULES, PROTECTED_ROOTS, WRITE_PROTECTED_COUNT } from './rules.mjs'
 
 export const name = 'dsh-destructive-guard'
 
 // 版本号只认 package.json，避免三处手写漂移。
 const { version: VERSION } = createRequire(import.meta.url)('./package.json')
-const GUARDED_TOOLS = new Set(['pwsh', 'bash', 'terminal', 'shell', 'cmd'])
-const FILE_TOOLS = new Set(['write', 'edit', 'apply_patch', 'str_replace_editor'])
+const GUARDED_TOOLS = new Set(['pwsh', 'bash', 'terminal', 'shell', 'cmd', 'ops_bash'])
+// ops_* 由 dsh-ops 注册，参数与官方工具不同名（单文件一律用 `path`，copy/move 另有 `to`）。
+// 不在这里列出的 ops_* 读取器不需要文件写入审查。
+const FILE_TOOLS = new Set([
+  'write', 'edit', 'apply_patch', 'str_replace_editor',
+  'ops_write_file', 'ops_edit_file', 'ops_replace', 'ops_remove', 'ops_copy', 'ops_move',
+])
+const READ_TOOLS = new Set(['read', 'ops_inspect_local_file', 'ops_read_files'])
 const STATUS_ROUTE = '/dsh-destructive-guard/status'
 const CHECK_ROUTE = '/dsh-destructive-guard/check'
 
@@ -36,10 +43,34 @@ function inspect(exec) {
   if (process.env.DSH_GUARD === 'off') return { verdict: 'allow' }
   const name = String(exec?.name || '')
   if (FILE_TOOLS.has(name)) return classifyFileWrite(name, exec?.arguments ?? {})
+  if (READ_TOOLS.has(name)) return inspectSecretRead(exec?.arguments ?? {})
   if (!GUARDED_TOOLS.has(name)) return { verdict: 'allow' }
   const command = commandOf(exec)
   if (!command) return { verdict: 'allow' }
   return classify(command)
+}
+
+/**
+ * `read` 工具读取秘密文件时拦下——否则 `cat .env` 被拦、`read .env` 却畅通，等于没拦。
+ * @returns {{verdict:'block'|'allow', rule?:string, reason?:string}}
+ */
+function inspectSecretRead(args) {
+  const candidates = []
+  const single = args.file_path ?? args.path ?? ''
+  if (typeof single === 'string' && single) candidates.push(single)
+  if (Array.isArray(args.files)) {
+    for (const entry of args.files) {
+      if (typeof entry?.path === 'string' && entry.path) candidates.push(entry.path)
+    }
+  }
+  if (candidates.length === 0) return { verdict: 'allow' }
+  const secret = candidates.find((raw) => isSecretPath(raw))
+  if (!secret) return { verdict: 'allow' }
+  return {
+    verdict: 'block',
+    rule: 'SECRET-READ',
+    reason: `[dsh-guard:SECRET-READ] 读取秘密文件（${secret}）：凭证、密钥与 token 不应进入会话上下文。请让用户手动查看，或明确指定要读的字段。`,
+  }
 }
 
 /**
@@ -150,6 +181,7 @@ export function apply(ctx) {
               enabled: process.env.DSH_GUARD !== 'off',
               guardedTools: [...GUARDED_TOOLS],
               fileTools: [...FILE_TOOLS],
+              readTools: [...READ_TOOLS],
               protectedRoots: PROTECTED_ROOTS.length,
               fileWriteTargets: WRITE_PROTECTED_COUNT,
               rules: RULES.map(([id, level, description]) => ({ id, level, description })),
@@ -164,6 +196,7 @@ export function apply(ctx) {
             try {
               const body = JSON.parse(await readBody(req))
               if (body?.file_path) {
+                if (String(body.tool || 'write') === 'read') return sendJson(res, 200, inspectSecretRead(body))
                 return sendJson(res, 200, classifyFileWrite(String(body.tool || 'write'), body))
               }
               const command = String(body?.command ?? '')

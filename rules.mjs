@@ -62,6 +62,9 @@ const SENSITIVE_CHILDREN = [
   '.bailian',
 ]
 
+/** 凭据 / 密钥目录：只要删除目标落在里面（任意深度），一律拦。 */
+const DEEP_SENSITIVE = ['.ssh', '.aws', '.gnupg']
+
 /** Windows 系统目录：递归删除一律拦。 */
 const SYSTEM_PREFIXES = [
   'c:/windows',
@@ -162,6 +165,165 @@ function hasRootTarget(segment) {
   )
 }
 
+/** 临时目录：删这里的内容是日常清理，真实日志里误拦最多的就是它们。 */
+const TEMP_DIRS = [`${HOME}/appdata/local/temp`, 'c:/windows/temp']
+
+function isTempPath(path) {
+  return TEMP_DIRS.some((dir) => path === dir || path.startsWith(`${dir}/`))
+}
+
+/** 单层变量表：`$name = 'value'` / `"value"` / value。只跟一层，够覆盖诺亚方舟的写法。 */
+function varTable(command) {
+  const table = new Map()
+  const text = String(command ?? '')
+  for (const match of text.matchAll(/\$([a-z_][\w:]*)\s*=\s*("[^"]*"|'[^']*'|[^;\n|]+)/gi)) {
+    table.set(match[1].toLowerCase(), match[2].trim().replace(/^["']|["']$/g, ''))
+  }
+  // `foreach ($d in (Get-ChildItem $home)) { Remove-Item $d }`：循环变量继承被遍历对象的危险程度。
+  for (const match of text.matchAll(/foreach\s*\(\s*\$([a-z_][\w:]*)\s+in\s+([^)]*)\)/gi)) {
+    const source = match[2].match(/(?:get-childitem|gci|ls|dir|get-item|gi)\s+("[^"]*"|'[^']*'|[^\s)]+)/i)
+    const target = source ? expandPath(source[1], table) : ''
+    if (evaluateTarget(target) === 'block') table.set(match[1].toLowerCase(), target)
+  }
+  // `$d = Get-ChildItem $HOME; $d | Remove-Item ...`：把集合变量的来源路径记下来，
+  // 否则管道那一侧只看到一个光秃秃的 `$d`，目标就丢了。
+  for (const match of text.matchAll(/\$([a-z_][\w:]*)\s*=\s*(?:get-childitem|gci|ls|dir|get-item|gi)\b([^;|\n]*)/gi)) {
+    const arg = match[2].match(/("[^"]*"|'[^']*'|[^\s)]+)/)
+    if (!arg || arg[1].startsWith('-')) continue
+    const target = expandPath(arg[1], table)
+    if (target) table.set(match[1].toLowerCase(), target)
+  }
+  return table
+}
+
+/** 展开一个删除目标：去引号、展开家目录写法与单层变量、把 MSYS 的 `/c/` 还原成 `c:/`。 */
+function expandPath(raw, table) {
+  let text = normalize(String(raw ?? ''))
+  text = text.replace(/^[("'\s]+|[)"'\s]+$/g, '')
+  text = text.replace(/^\/\/\?\//, '') // `\\?\C:\...` 设备路径前缀
+  text = text.replace(/^(?:-literalpath|-path|-lp)\s+/, '')
+  const expandHome = (value) =>
+    value
+      .replace(/^~(?=\/|$)/, HOME)
+      .replace(
+        /^(?:\$(?:env:)?(?:home|userprofile|homepath)|\$\(\s*\$env:userprofile\s*\)|%(?:userprofile|homepath)%)/,
+        HOME,
+      )
+  text = expandHome(text)
+  const variable = text.match(/^\$([a-z_][\w:]*)\b/)
+  if (variable) {
+    const value = table.get(variable[1].toLowerCase())
+    // 变量值本身也可能是 `$env:USERPROFILE\...`，替换完再展开一次家目录。
+    if (value !== undefined) text = expandHome(`${normalize(value).replace(/^["']|["']$/g, '')}${text.slice(variable[0].length)}`)
+  }
+  text = text.replace(/^\/([a-z])\//, '$1:/')
+  // 折叠 `.` 与 `..`：`~/Desktop/..` 就是家目录本身，别让目标解析绕过保护。
+  text = text.replace(/\/\.(?=\/|$)/g, '')
+  let previous
+  do {
+    previous = text
+    text = text.replace(/\/[^/]+\/\.\.(?=\/|$)/g, '')
+  } while (text !== previous && text.length > 0)
+  return text.replace(/\/+$/, '').replace(/\/{2,}/g, '/')
+}
+
+/**
+ * 判定“删除这个目标”有多危险。
+ * 关键区别：家目录根本身 / 敏感子目录任意深度 → block；家目录下的一级数据目录整体 → block；
+ * 更深的路径（`~/Desktop/x.png`、`%TEMP%\a.mjs`）→ allow，日常清理几乎都落在这一层。
+ * @returns {'block'|'ask'|'allow'}
+ */
+function evaluateTarget(path) {
+  if (!path) return 'allow'
+  // `[Environment]::GetFolderPath('UserProfile')` 这类运行时取值，静态看不到结果，按家目录处理。
+  if (/getfolderpath|specialfolders?|environment::/.test(path)) return 'block'
+  if (path.includes('$') || path.includes('%')) return hasHomeVar(path) ? 'block' : 'allow'
+  if (isTempPath(path)) return 'allow'
+  if (path === HOME || path === `${HOME}/*` || path === `${HOME}*`) return 'block'
+  if (path.startsWith(`${HOME}/`)) {
+    const relative = path.slice(HOME.length + 1)
+    if (relative === '*' || relative === '/*') return 'block'
+    const parts = relative.split('/')
+    const first = parts[0]
+    const depth = parts.length
+    // 家目录一级的通配（`~/Doc*`、`~/*`）可能命中受保护目录，按整体删除处理。
+    if (depth === 1 && /[*?]/.test(first)) return 'block'
+    // 凭据 / 密钥目录：任意深度都不许删。
+    if (DEEP_SENSITIVE.includes(first)) return 'block'
+    if (SENSITIVE_CHILDREN.includes(first)) {
+      if (depth === 1) return 'block'
+      // `.dsh` 的会话、记忆、profile 再深一层仍是 DSH 的命根子；更深的构建产物放行。
+      if (first === '.dsh') {
+        if (['sessions', 'memory'].includes(parts[1])) return 'block'
+        return depth <= 2 ? 'block' : 'allow'
+      }
+      return depth === 2 ? 'ask' : 'allow'
+    }
+    if (PROTECTED_CHILDREN.includes(first)) {
+      if (depth === 1) return 'block'
+      return depth === 2 && relative.endsWith('/*') ? 'ask' : 'allow'
+    }
+    return 'allow'
+  }
+  for (const extra of EXTRA_PROTECTED) {
+    if (path === extra) return 'block'
+    if (path.startsWith(`${extra}/`)) return path.slice(extra.length + 1).includes('/') ? 'allow' : 'block'
+  }
+  for (const prefix of SYSTEM_PREFIXES) {
+    if (path === prefix || path.startsWith(`${prefix}/`)) return 'block'
+  }
+  if (/^[a-z]:\/?$/.test(path) || path === '/' || path === '*' || /^[a-z]:\/\*$/.test(path)) return 'block'
+  if (/^c:\/users\/[^/]+$/.test(path)) return 'block'
+  if (/^\/mnt\/[a-z]\/?$/.test(path)) return 'block'
+  if (/^\/mnt\/[a-z]\/(?:users|windows|program)/.test(path)) return 'block'
+  for (const root of ['/etc', '/usr', '/var', '/boot', '/root', '/opt', '/srv']) {
+    if (path === root || path.startsWith(`${root}/`)) return 'block'
+  }
+  if (/^\/(?:home|users)\/[^/]+$/.test(path)) return 'block'
+  return 'allow'
+}
+
+/** 判断一段文本里是否直接出现了“家目录根 / 敏感子目录 / 系统目录”的字面量。 */
+function containsProtectedRoot(text) {
+  if (!text) return false
+  if (isTempPath(text)) return false
+  if (cachedRe(`(?:^|[\\s"'(=])${escapeRe(HOME)}(?![a-z0-9_.\\/-])`).test(text)) return true
+  for (const child of SENSITIVE_CHILDREN) {
+    if (hasPathPrefix(text, `${HOME}/${child}`)) return true
+  }
+  for (const extra of EXTRA_PROTECTED) {
+    if (hasToken(text, extra)) return true
+  }
+  for (const prefix of SYSTEM_PREFIXES) {
+    if (cachedRe(`(?:^|[\\s"'(=])${escapeRe(prefix)}(?=/|\\*|$|[\\s"';|)&])`).test(text)) return true
+  }
+  return false
+}
+
+/** 从一条删除语句里取出“动词 + 目标参数”，`-Recurse` 之类的开关不算目标。 */
+function deleteArgs(segment) {
+  const verb = deleteVerb(segment)
+  if (!verb) return { verb: '', args: [] }
+  const text = stripWrappers(segment)
+  const heads = {
+    'remove-item': /^(?:remove-item|ri)\b/i,
+    del: /^(?:del|erase)\b/i,
+    rmdir: /^(?:rmdir|rd)\b/i,
+    rm: /^rm\b/i,
+    shred: /^(?:shred|sdelete)\b/i,
+    find: /^find\b/i,
+    dotnet: /^(?:\[(?:system\.)?io\.(?:directory|file)\]\s*::\s*delete)/i,
+  }
+  const rest = text.replace(heads[verb] ?? /^/, '')
+  const args = []
+  for (const match of rest.matchAll(/"([^"]*)"|'([^']*)'|(\S+)/g)) {
+    const token = (match[1] ?? match[2] ?? match[3] ?? '').trim()
+    if (!token || /^-[a-z]+$/i.test(token) || /^(?:\.|\.\.|\d+)$/.test(token)) continue
+    args.push(token)
+  }
+  return { verb, args }
+}
+
 /** 家目录、家目录一级子目录、其他用户目录、系统目录。 */
 function protectedLiteral(segment) {
   if (hasToken(segment, HOME)) return HOME
@@ -214,7 +376,7 @@ function stripWrappers(segment) {
     /^(?:if|elseif|while|for|foreach|switch|try|catch|finally|do|begin|process|end|trap)\b[^{}]*\{\s*/
   for (let index = 0; index < 8; index += 1) {
     const previous = text
-    text = text.replace(/^[&.{("'\s]+/, '').replace(/[)}}"'\s]+$/, '')
+    text = text.replace(/^[&.{("'\s]+/, '').replace(/[)}}\s]+$/, '')
     text = text.replace(wrapper, '').replace(controlFlow, '').trim()
     if (text === previous) break
   }
@@ -292,23 +454,49 @@ function isRecursive(verb, segment) {
   return false
 }
 
-/**
- * 找出“被赋了受保护路径”的变量：`$t = 'C:\Users\ROSE'; Remove-Item -Recurse -Force $t`。
- * 静态分析只能跟一层，但足以覆盖诺亚方舟那种先取家目录再删的写法。
- */
-function taintedVars(command) {
-  const names = new Set()
-  for (const match of String(command ?? '').matchAll(/\$([a-z_][\w:]*)\s*=\s*([^;\n]+)/gi)) {
-    const value = normalize(match[2])
-    if (protectedLiteral(value) || hasHomeVar(value) || hasRootTarget(value)) {
-      names.add(match[1].toLowerCase())
-    }
+/** 读取类命令：只有它们出现在命令里，才去判“是不是在读秘密文件”。 */
+const READ_VERBS = /(?:^|[\s;&|(])(?:cat|type|more|less|head|tail|get-content|gc|select-string|sls|grep|rg|string|open|read)\b/i
+
+/** 秘密文件：读出来就可能被外传，比删掉更难补救。 */
+const SECRET_PATTERNS = [
+  /(?:^|\/)\.env(?:\.[a-z0-9]+)*$/, // .env / .env.local，`.env.example` 单独放行
+  /(?:^|\/)\.ssh\//,
+  /(?:^|\/)\.aws\/(?:credentials|config)$/,
+  /(?:^|\/)\.gnupg\/(?:.*\.key|private-keys.*)$/,
+  /(?:^|\/)\.netrc$/,
+  /(?:^|\/)\.git-credentials$/,
+  /(?:^|\/)\.npmrc$/,
+  /(?:^|\/)\.config\/gh\/hosts\.yml$/,
+  /(?:^|\/)\.dsh\/\.credentials\.(?:ya?ml|json)$/,
+  /(?:^|\/)\.dsh\/\.(?:github|mcd)-mcp-token$/,
+  /(?:^|\/)\.dsh\/automation\.env$/,
+  /(?:^|\/)(?:id_rsa|id_ed25519|id_ecdsa)(?:\.pub)?$/,
+  /(?:^|\/)[^/\s]+\.(?:pem|key|pfx|p12)$/,
+]
+
+function secretTarget(segment, table) {
+  const tokens = segment.match(/"[^"]*"|'[^']*'|\S+/g) ?? []
+  for (const raw of tokens) {
+    const token = expandPath(raw, table)
+    if (!token || /^[a-z]+$/i.test(token)) continue
+    if (/\.env\.example$/.test(token)) continue
+    if (SECRET_PATTERNS.some((pattern) => pattern.test(token))) return token
   }
-  return [...names]
+  return ''
 }
 
-function block(rule, reason) {
-  return { verdict: 'block', rule, reason: `[dsh-guard:${rule}] ${reason}` }
+/**
+ * 判定单个文件路径是否属于秘密文件（给 `read` 工具用）。
+ * @param {string} rawPath
+ * @returns {boolean}
+ */
+export function isSecretPath(rawPath) {
+  const token = expandPath(rawPath, new Map())
+  if (!token || /\.env\.example$/.test(token)) return false
+  return SECRET_PATTERNS.some((pattern) => pattern.test(token))
+}
+
+function block(rule, reason) {  return { verdict: 'block', rule, reason: `[dsh-guard:${rule}] ${reason}` }
 }
 
 function ask(rule, reason) {
@@ -323,7 +511,7 @@ function ask(rule, reason) {
 export function classify(command) {
   const whole = normalize(command)
   if (!whole) return { verdict: 'allow' }
-  const taint = taintedVars(command)
+  const vars = varTable(command)
 
   // ---- 不可逆：磁盘 / 恢复 / 日志 / 注册表 / 安全软件 ----
   if (/\b(?:vssadmin|wbadmin|diskshadow)\b/.test(whole)) {
@@ -365,14 +553,20 @@ export function classify(command) {
   if (/\breg(?:\.exe)?\s+delete\s+["']?(?:hklm|hku|hkcr|hkcc)\b/.test(whole)) {
     return block('REGISTRY-WIPE', '删除 HKLM/HKU 注册表项可能让系统或软件无法启动。')
   }
-  if (/\breg(?:\.exe)?\s+delete\s+["']?hkcu\b/.test(whole)) {
+  if (/\breg(?:\.exe)?\s+delete\s+["'\\]*hkcu\b/.test(whole)) {
     return ask('REGISTRY-USER', '删除 HKCU 项可能让当前用户的软件配置失效。')
   }
   if (/\btakeown(?:\.exe)?\s+\/f\s+[a-z]:\/?(?=\s|$)/.test(whole) || /\bicacls(?:\.exe)?\s+[a-z]:\/?(?=\s|$)[^;]*\/reset/.test(whole)) {
     return block('ACL-TAKEOVER', '夺取盘根 / 系统目录所有权或重置 ACL 会破坏系统权限。')
   }
-  if (/\b(?:takeown|icacls)(?:\.exe)?\b/.test(whole) && (protectedLiteral(whole) || hasHomeVar(whole))) {
-    return block('ACL-TAKEOVER', '夺取家目录 / 受保护目录的所有权或重置 ACL，会让后续删除畅通无阻。')
+  // 只有“变更型”的 ACL 操作才算接管；纯查询（`icacls "C:\Program Files\Bandizip"`）放行。
+  if (
+    (/\btakeown(?:\.exe)?\b/.test(whole) && /\s\/f\b/.test(whole)) ||
+    (/\bicacls(?:\.exe)?\b/.test(whole) && /\/(?:reset|grant|deny|setowner|inheritance)\b/.test(whole))
+  ) {
+    if (protectedLiteral(whole) || hasHomeVar(whole)) {
+      return block('ACL-TAKEOVER', '夺取家目录 / 受保护目录的所有权或重置 ACL，会让后续删除畅通无阻。')
+    }
   }
   if (/\bsc(?:\.exe)?\s+delete\b/.test(whole) || /\bnet(?:\.exe)?\s+user\s+\S+\s+\/delete\b/.test(whole) || /\bnet(?:\.exe)?\s+localgroup\s+administrators\b[^;]*\/delete/.test(whole)) {
     return block('SERVICE-ACCOUNT', '删除系统服务 / 本地账户 / 管理员组成员需要人工确认。')
@@ -399,17 +593,43 @@ export function classify(command) {
   }
 
   // 管道式批量删除：`Get-ChildItem C:\Users\ROSE -Recurse | Remove-Item -Force`。
-  // 生产者不限（`ls`/`gci`/`Get-Item`/`$_` 都可以），删除端认 PowerShell 别名 `ri`/`del`/`rm` 等。
-  // 逐语句判，别让跨行的管道与删除词拼在一起。
+  // 逐语句判（不跨换行），并且只认“生产者目标本身危险”的管道：
+  // 删 `~/Desktop` 整批仍拦；删项目构建目录、删 `%TEMP%` 明细放行。
+  // `cd $HOME; Get-ChildItem | Remove-Item -Recurse -Force`：生产者不带路径参数，
+  // 但工作目录已经被切到受保护目录，列出来的就是家目录里的东西。
+  const cdProtected = splitSegments(command).some((segment) => {
+    const match = stripWrappers(segment).match(/^(?:cd|set-location|sl|pushd)\s+("[^"]*"|'[^']*'|\S+)/)
+    return Boolean(match) && evaluateTarget(expandPath(match[1], vars)) === 'block'
+  })
   for (const statement of splitStatements(command)) {
-    if (
-      /\|\s*[^|]*?\b(?:remove-item|ri|del|erase|rm|rmdir|rd)\b/.test(statement) &&
-      (protectedLiteral(statement) || hasHomeVar(statement) || hasRootTarget(statement))
-    ) {
-      return block(
-        'FS-HOME',
-        `管道批量删除指向受保护路径（${protectedLiteral(statement) || '家目录变量'}）。请改用具体的构建 / 临时目录，并由用户手动确认。`,
-      )
+    const parts = statement.split('|')
+    if (parts.length < 2) continue
+    const last = stripWrappers(parts[parts.length - 1])
+    if (!/^(?:remove-item|ri|del|erase|rm|rmdir|rd)\b/.test(last)) continue
+    const producer = parts.slice(0, -1).join('|')
+    const produced = producer.match(/(?:get-childitem|gci|ls|dir|get-item|gi)\s+(?!-)(?:"([^"]*)"|'([^']*)'|([^\s|]+))/)
+    const target = produced ? expandPath(produced[1] ?? produced[2] ?? produced[3], vars) : ''
+    const level = evaluateTarget(target)
+    if (level === 'block') {
+      return block('FS-HOME', `管道批量删除指向受保护路径（${target}）。请改用具体的构建 / 临时目录，并由用户手动确认。`)
+    }
+    if (level === 'ask') {
+      return ask('FS-HOME', `管道将清空受保护目录（${target}），请先确认范围。`)
+    }
+    // 生产者是存过危险路径的变量（`$d = Get-ChildItem $HOME; $d | Remove-Item`）。
+    if (!produced) {
+      const variable = producer.match(/\$([a-z_][\w:]*)\s*$/)
+      const stored = variable ? vars.get(variable[1].toLowerCase()) : ''
+      if (stored && evaluateTarget(expandPath(stored, vars)) === 'block') {
+        return block('FS-HOME', `管道批量删除的是变量 ${variable[0]}，它的来源是受保护路径（${stored}）。`)
+      }
+    }
+    // 生产者是裸的家目录变量（`ls $home | ri`）时没有路径参数，单独认一次。
+    if (!produced && /(?:^|[\s=(])\$(?:home|env:userprofile|env:homepath)\b(?!\s*[/\\])/.test(producer)) {
+      return block('FS-HOME', '管道批量删除指向家目录根（$home）。这与诺亚方舟事故是同一类操作。')
+    }
+    if (!produced && cdProtected && /\b(?:get-childitem|gci|ls|dir|get-item|gi)\b/.test(producer)) {
+      return block('FS-HOME', '工作目录已切到受保护目录，管道批量删除等价于清空该目录。')
     }
   }
 
@@ -422,41 +642,67 @@ export function classify(command) {
     return block('FS-HOME', 'WSL 里对 /mnt/c 的用户目录 / 系统目录做递归删除。')
   }
 
-  // 包装器绕过：Start-Process / iex / runas / Start-Job 里再拼删除命令
+  // 包装器绕过：Start-Process / iex / runas / Start-Job 里再拼删除命令。
+  // 只有里面真的出现“家目录根 / 敏感子目录 / 系统目录”才拦：普通软件的启动脚本
+  // （Everything 之类，正文里带一堆 `C:\Users\ROSE\AppData\...`）不再误伤。
   if (
     /\b(?:start-process|start-job|start-threadjob|invoke-expression|invoke-command|runas)\b/.test(whole) &&
     /\b(?:remove-item|del|erase|rm|rmdir|format|vssadmin)\b/.test(whole) &&
-    (protectedLiteral(whole) || hasHomeVar(whole))
+    (containsProtectedRoot(whole) || hasHomeVar(whole))
   ) {
-    return block('WRAPPED-DESTRUCTIVE', '在包装器 / 表达式里拼接删除命令，无法可靠审查目标路径。')
+    return block('WRAPPED-DESTRUCTIVE', '在包装器 / 表达式里拼接删除命令，且目标落在受保护路径上。')
   }
 
-  // 内联解释器删除：python -c "shutil.rmtree(...)" / node -e "fs.rmSync(...)"
+  // 内联解释器删除：只看 `-c` / `-e` 之后的代码段，
+  // 避免 `cd C:\Users\ROSE\Desktop\...; python -c "os.remove('q601_*.png')"` 因前置路径误拦。
+  const inlineStart = whole.search(/\s-(?:c|e)\s/)
+  const inline = inlineStart >= 0 ? whole.slice(inlineStart) : ''
   if (
+    inline &&
     /\b(?:python|py|python3)(?:\.exe)?\s+-c\b/.test(whole) &&
-    /(?:shutil\.rmtree|os\.(?:remove|unlink|rmdir)|pathlib[^;]*unlink|os\.system|subprocess)/.test(whole) &&
-    (protectedLiteral(whole) || hasHomeVar(whole))
+    /(?:shutil\.rmtree|os\.(?:remove|unlink|rmdir)|pathlib[^;]*unlink|os\.system|subprocess)/.test(inline) &&
+    containsProtectedRoot(inline)
   ) {
     return block('SCRIPT-DELETE', '内联 Python 删除调用指向受保护路径。')
   }
   if (
+    inline &&
     /\bnode(?:\.exe)?\s+-e\b/.test(whole) &&
-    /(?:rmsync|rmdirsync|unlinksync|fs\.rm\b|child_process)/.test(whole) &&
-    (protectedLiteral(whole) || hasHomeVar(whole))
+    /(?:rmsync|rmdirsync|unlinksync|fs\.rm\b|child_process)/.test(inline) &&
+    containsProtectedRoot(inline)
   ) {
     return block('SCRIPT-DELETE', '内联 Node 删除调用指向受保护路径。')
   }
   if (
+    inline &&
     /\bperl(?:\.exe)?\s+-e\b/.test(whole) &&
-    /(?:unlink|rmtree|system)/.test(whole) &&
-    (protectedLiteral(whole) || hasHomeVar(whole))
+    /(?:unlink|rmtree|system)/.test(inline) &&
+    containsProtectedRoot(inline)
   ) {
     return block('SCRIPT-DELETE', '内联 Perl 删除调用指向受保护路径。')
   }
 
   // ---- 不透明 / 远程执行 ----
-  if (/(?:^|\s)-(?:encodedcommand|enc)\b/.test(whole) || /powershell(?:\.exe)?\s+-(?:e|en|enc)\s+[a-z0-9+/=]{20,}/.test(whole)) {
-    return block('ENCODED-CMD', 'EncodedCommand 无法静态审查，可能隐藏任意删除操作。')
+  // EncodedCommand 先尝试解码（UTF-16LE），解出无害命令就放行；解不出或解出危险命令才拦。
+  // 必须在**原始命令**上取 base64：normalize 会转小写，base64 是大小写敏感的。
+  const rawCommand = String(command ?? '')
+  const encoded =
+    rawCommand.match(/(?:^|\s)-{1,2}(?:encodedcommand|enc)\s+([A-Za-z0-9+/=]{20,})/i) ??
+    rawCommand.match(/\b(?:powershell|pwsh)(?:\.exe)?\s+-(?:e|en)\s+([A-Za-z0-9+/=]{20,})/i)
+  if (encoded) {
+    let decoded = ''
+    try {
+      decoded = Buffer.from(encoded[1], 'base64').toString('utf16le').replace(/[^\x09\x0a\x0d\x20-\x7e]/g, '')
+    } catch {
+      decoded = ''
+    }
+    if (!decoded.trim()) {
+      return block('ENCODED-CMD', 'EncodedCommand 无法解码为可读文本，可能隐藏任意删除操作。')
+    }
+    const inner = classify(decoded)
+    if (inner.verdict !== 'allow') {
+      return block('ENCODED-CMD', `EncodedCommand 解码后命中 ${inner.rule}：${decoded.slice(0, 160)}`)
+    }
   }
   if (/(?:iwr|invoke-webrequest|irm|invoke-restmethod|curl|wget)\b[^|;]*\|\s*(?:iex|invoke-expression|sh|bash|pwsh|powershell)\b/.test(whole)) {
     return block('REMOTE-EXEC', '下载后直接管道执行远程代码，内容不可审查。')
@@ -502,30 +748,43 @@ export function classify(command) {
     return ask('DB-DESTRUCTIVE', 'DROP / TRUNCATE 会不可逆地删除数据库对象或数据。')
   }
 
+  // ---- 秘密读取：删掉还能从备份恢复，读走再外传就收不回来了 ----
+  if (READ_VERBS.test(whole)) {
+    for (const segment of splitSegments(command)) {
+      if (!READ_VERBS.test(segment)) continue
+      const secret = secretTarget(segment, vars)
+      if (secret) {
+        return block('SECRET-READ', `读取凭据 / 密钥文件（${secret}）可能造成外泄。请由用户手动查看，或改用环境变量注入。`)
+      }
+    }
+  }
+
   // ---- 文件系统递归删除：逐段判定 ----
   for (const segment of splitSegments(command)) {
-    const verb = deleteVerb(segment)
+    const { verb, args } = deleteArgs(segment)
     if (!verb) continue
     const recursive = isRecursive(verb, segment)
-    const tainted = taint.find((name) => cachedRe(`\\$${escapeRe(name)}\\b`).test(segment))
-    const protectedPath = protectedLiteral(segment) || (tainted ? `$${tainted}` : '')
-    const homeVar = hasHomeVar(segment)
 
     // `C:\Users\ROSE\Documents\..\Desktop` 这类路径穿越
     if (
       recursive &&
       /(?:^|[\s"'(=/])\.\.(?:\/|$)/.test(segment) &&
-      ((HOME && segment.includes(HOME)) || homeVar)
+      ((HOME && segment.includes(HOME)) || hasHomeVar(segment))
     ) {
       return block('FS-TRAVERSAL', '递归删除路径里含 .. 穿越，最终目标可能落回家目录。')
     }
 
-    if (protectedPath || homeVar) {
-      if (recursive || verb !== 'rm') {
+    for (const arg of args) {
+      const target = expandPath(arg, vars)
+      const level = evaluateTarget(target)
+      if (level === 'block') {
         return block(
           'FS-HOME',
-          `删除指向受保护路径（${protectedPath || '家目录变量'}）。这与诺亚方舟事故是同一类操作：先删家目录，再连带 .dsh/.claude/.doubao。请改用明确的临时目录，并由用户手动确认。`,
+          `删除指向受保护路径（${target || arg}）。这与诺亚方舟事故是同一类操作：先删家目录，再连带 .dsh/.claude/.doubao。请改用明确的临时目录，并由用户手动确认。`,
         )
+      }
+      if (level === 'ask') {
+        return ask('FS-HOME', `将清空受保护目录（${target}）里的全部内容，请先确认范围。`)
       }
     }
 
@@ -557,16 +816,20 @@ function expandTarget(raw) {
 }
 
 /**
- * 判定 `write` / `edit` / `apply_patch` 的落点是否属于“覆盖就不可恢复”的文件。
- * `apply_patch` 没有 `file_path`，从补丁头的 `*** Update File: <path>` 行取目标。
- * @param {string} toolName `write` / `edit` / `apply_patch`，只用于文案。
- * @param {unknown} args 工具参数，认 `file_path` / `path` / `target` 与补丁正文。
+ * 判定 `write` / `edit` / `apply_patch` / `ops_write_file` / `ops_edit_file` / `ops_remove`
+ * 等文件写入的落点是否属于“覆盖或删除就不可恢复”的文件。
+ * `apply_patch` 没有 `file_path`，从补丁头的 `*** Update File: <path>` 行取目标；
+ * dsh-ops 的 copy/move 还带目标 `to`，源与目标都要检查。
+ * @param {string} toolName 工具名，只用于文案。
+ * @param {unknown} args 工具参数，认 `file_path` / `path` / `target` / `to` 与补丁正文。
  * @returns {{verdict:'block'|'allow', rule?:string, reason?:string}}
  */
 export function classifyFileWrite(toolName, args) {
   const targets = []
   const single = args?.file_path ?? args?.path ?? args?.target
   if (single) targets.push(String(single))
+  // dsh-ops 的 copy / move 有独立的 `to`；目标也可能落在受保护路径上。
+  if (typeof args?.to === 'string' && args.to) targets.push(args.to)
   const patch = args?.patch ?? args?.input ?? args?.diff
   if (typeof patch === 'string' && patch) {
     for (const match of patch.matchAll(/^\*\*\* (?:Add|Update|Delete) File:\s*(.+)$/gim)) {
@@ -608,6 +871,7 @@ export const RULES = [
   ['WRAPPED-DESTRUCTIVE', 'block', '包装器 / 表达式里拼接删除命令'],
   ['SCRIPT-DELETE', 'block', '内联 Python / Node / Perl 删除受保护路径'],
   ['FS-HOME', 'block', '删除家目录 / 敏感子目录（.ssh/.dsh 等）/ 受保护根的子项'],
+  ['SECRET-READ', 'block', '读取 .env / .ssh / 云凭据 / DSH 凭证等秘密文件'],
   ['FS-PROTECTED', 'block', 'write / edit 覆盖会话日志、记忆、凭证、密钥、系统目录'],
   ['FS-ROOT', 'block', '递归删除根目录 / 盘符根 / 通配整盘'],
   ['FS-PERMISSIONS', 'block', '递归修改根目录权限 / 属主'],
